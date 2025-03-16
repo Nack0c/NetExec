@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import os
+from errno import EHOSTUNREACH
 from binascii import hexlify
 from datetime import datetime
 from re import sub, I
@@ -20,6 +21,7 @@ from impacket.dcerpc.v5.samr import (
     UF_TRUSTED_FOR_DELEGATION,
     UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION,
     UF_SERVER_TRUST_ACCOUNT,
+    SAM_MACHINE_ACCOUNT,
 )
 from impacket.krb5 import constants
 from impacket.krb5.kerberosv5 import getKerberosTGS, SessionKeyDecryptionError
@@ -209,7 +211,11 @@ class ldap(connection):
             self.logger.debug(f"{e} on host {self.host}")
             return False
         except OSError as e:
-            self.logger.error(f"Error getting ldap info {e}")
+            if e.errno == EHOSTUNREACH:
+                self.logger.info(f"Error connecting to {self.host} - {e}")
+                return False
+            else:
+                self.logger.error(f"Error getting ldap info {e}")
 
         self.logger.debug(f"Target: {target}; target_domain: {target_domain}; base_dn: {base_dn}")
         self.target = target
@@ -253,7 +259,8 @@ class ldap(connection):
             ntlm_info = parse_challenge(ntlm_challenge)
             self.server_os = ntlm_info["os_version"]
 
-        if not self.kdcHost and self.domain and self.domain == self.remoteName:
+        # using kdcHost is buggy on impacket when using trust relation between ad so we kdcHost must stay to none if targetdomain is not equal to domain
+        if not self.kdcHost and self.domain and self.domain == self.targetDomain:
             result = self.resolver(self.domain)
             self.kdcHost = result["host"] if result else None
             self.logger.info(f"Resolved domain: {self.domain} with dns, kdcHost: {self.kdcHost}")
@@ -573,7 +580,7 @@ class ldap(connection):
         attributes = ["objectSid"]
         resp = self.search(search_filter, attributes, sizeLimit=0)
         answers = []
-        if resp and (self.password != "" or self.lmhash != "" or self.nthash != "") and self.username != "":
+        if resp and (self.password != "" or self.lmhash != "" or self.nthash != "" or self.aesKey != "") and self.username != "":
             for attribute in resp[0][1]:
                 if str(attribute["type"]) == "objectSid":
                     sid = self.sid_to_str(attribute["vals"][0])
@@ -673,25 +680,47 @@ class ldap(connection):
 
     def groups(self):
         # Building the search filter
-        search_filter = "(objectCategory=group)"
-        attributes = ["name"]
+        if self.args.groups:
+            self.logger.debug(f"Dumping group: {self.args.groups}")
+            search_filter = f"(cn={self.args.groups})"
+            attributes = ["member"]
+        else:
+            search_filter = "(objectCategory=group)"
+            attributes = ["cn", "member"]
         resp = self.search(search_filter, attributes, 0)
-        if resp:
-            self.logger.debug(f"Total of records returned {len(resp):d}")
+        resp_parsed = parse_result_attributes(resp)
+        self.logger.debug(f"Total of records returned {len(resp):d}")
 
-            for item in resp:
-                if isinstance(item, ldapasn1_impacket.SearchResultEntry) is not True:
-                    continue
-                name = ""
+        if self.args.groups:
+            if not resp_parsed:
+                self.logger.fail(f"Group {self.args.groups} not found")
+            elif not resp_parsed[0]:
+                self.logger.fail(f"Group {self.args.groups} has no members")
+            else:
+                # Fix if group has only one member
+                if not isinstance(resp_parsed[0]["member"], list):
+                    resp_parsed[0]["member"] = [resp_parsed[0]["member"]]
+                for user in resp_parsed[0]["member"]:
+                    self.logger.highlight(user.split(",")[0].split("=")[1])
+        else:
+            for item in resp_parsed:
                 try:
-                    for attribute in item["attributes"]:
-                        if str(attribute["type"]) == "name":
-                            name = str(attribute["vals"][0])
-                    self.logger.highlight(f"{name}")
+                    # Fix if group has only one member
+                    if not isinstance(item.get("member", []), list):
+                        item["member"] = [item["member"]]
+                    self.logger.highlight(f"{item['cn']:<40} membercount: {len(item.get('member', []))}")
                 except Exception as e:
                     self.logger.debug("Exception:", exc_info=True)
                     self.logger.debug(f"Skipping item, cannot process due to error {e}")
-            return
+
+    def computers(self):
+        resp = self.search(f"(sAMAccountType={SAM_MACHINE_ACCOUNT})", ["name"], 0)
+        resp_parse = parse_result_attributes(resp)
+
+        if resp:
+            self.logger.display(f"Total records returned: {len(resp_parse)}")
+            for item in resp_parse:
+                self.logger.highlight(item["name"] + "$")
 
     def dc_list(self):
         # Building the search filter
@@ -777,6 +806,7 @@ class ldap(connection):
     def asreproast(self):
         if self.password == "" and self.nthash == "" and self.kerberos is False:
             return False
+
         # Building the search filter
         search_filter = "(&(UserAccountControl:1.2.840.113556.1.4.803:=%d)(!(UserAccountControl:1.2.840.113556.1.4.803:=%d))(!(objectCategory=computer)))" % (UF_DONT_REQUIRE_PREAUTH, UF_ACCOUNTDISABLE)
         attributes = [
@@ -962,19 +992,20 @@ class ldap(connection):
         self.logger.debug(f"Querying LDAP server with filter: {search_filter} and attributes: {attributes}")
         try:
             resp = self.search(search_filter, attributes, 0)
+            resp_parsed = parse_result_attributes(resp)
         except LDAPFilterSyntaxError as e:
             self.logger.fail(f"LDAP Filter Syntax Error: {e}")
             return
-        for item in resp:
-            if isinstance(item, ldapasn1_impacket.SearchResultEntry) is not True:
-                continue
-            self.logger.success(f"Response for object: {item['objectName']}")
-            for attribute in item["attributes"]:
-                attr = f"{attribute['type']}:"
-                vals = str(attribute["vals"]).replace("\n", "")
-                if "SetOf: " in vals:
-                    vals = vals.replace("SetOf: ", "")
-                self.logger.highlight(f"{attr:<20} {vals}")
+        for idx, entry in enumerate(resp_parsed):
+            self.logger.success(f"Response for object: {resp[idx]['objectName']}")
+            for attribute in entry:
+                if isinstance(entry[attribute], list) and entry[attribute]:
+                    # Display first item in the same line as attribute
+                    self.logger.highlight(f"{attribute:<20} {entry[attribute].pop(0)}")
+                    for item in entry[attribute]:
+                        self.logger.highlight(f"{'':<20} {item}")
+                else:
+                    self.logger.highlight(f"{attribute:<20} {entry[attribute]}")
 
     def find_delegation(self):
         def printTable(items, header):
