@@ -283,6 +283,16 @@ class smb(connection):
         self.output_filename = os.path.expanduser(f"~/.nxc/logs/{self.hostname}_{self.host}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}".replace(":", "-"))
 
         try:
+            # DCs seem to want us to logoff first, windows workstations sometimes reset the connection
+            self.conn.logoff()
+        except Exception as e:
+            self.logger.debug(f"Error logging off system: {e}")
+
+        # Check smbv1
+        if not self.args.no_smbv1:
+            self.smbv1 = self.create_smbv1_conn(check=True)
+
+        try:
             self.db.add_host(
                 self.host,
                 self.hostname,
@@ -293,16 +303,6 @@ class smb(connection):
             )
         except Exception as e:
             self.logger.debug(f"Error adding host {self.host} into db: {e!s}")
-
-        try:
-            # DCs seem to want us to logoff first, windows workstations sometimes reset the connection
-            self.conn.logoff()
-        except Exception as e:
-            self.logger.debug(f"Error logging off system: {e}")
-
-        # Check smbv1
-        if not self.args.no_smbv1:
-            self.smbv1 = self.create_smbv1_conn(check=True)
 
         # DCOM connection with kerberos needed
         self.remoteName = self.host if not self.kerberos else f"{self.hostname}.{self.targetDomain}"
@@ -316,7 +316,8 @@ class smb(connection):
     def print_host_info(self):
         signing = colored(f"signing:{self.signing}", host_info_colors[0], attrs=["bold"]) if self.signing else colored(f"signing:{self.signing}", host_info_colors[1], attrs=["bold"])
         smbv1 = colored(f"SMBv1:{self.smbv1}", host_info_colors[2], attrs=["bold"]) if self.smbv1 else colored(f"SMBv1:{self.smbv1}", host_info_colors[3], attrs=["bold"])
-        self.logger.display(f"{self.server_os}{f' x{self.os_arch}' if self.os_arch else ''} (name:{self.hostname}) (domain:{self.targetDomain}) ({signing}) ({smbv1})")
+        ntlm = colored(f"(NTLM:{not self.no_ntlm})", host_info_colors[2], attrs=["bold"]) if self.no_ntlm else ""
+        self.logger.display(f"{self.server_os}{f' x{self.os_arch}' if self.os_arch else ''} (name:{self.hostname}) (domain:{self.targetDomain}) ({signing}) ({smbv1}) {ntlm}")
 
         if self.args.generate_hosts_file or self.args.generate_krb5_file:
             from impacket.dcerpc.v5 import nrpc, epm
@@ -330,8 +331,9 @@ class smb(connection):
 
             if self.args.generate_hosts_file:
                 with open(self.args.generate_hosts_file, "a+") as host_file:
-                    host_file.write(f"{self.host}    {self.hostname} {self.hostname}.{self.targetDomain} {self.targetDomain if isdc else ''}\n")
-                    self.logger.debug(f"{self.host}    {self.hostname} {self.hostname}.{self.targetDomain} {self.targetDomain if isdc else ''}")
+                    dc_part = f" {self.targetDomain}" if isdc else ""
+                    host_file.write(f"{self.host}     {self.hostname}.{self.targetDomain}{dc_part} {self.hostname}\n")
+                    self.logger.debug(f"{self.host}    {self.hostname}.{self.targetDomain}{dc_part} {self.hostname}")
             elif self.args.generate_krb5_file and isdc:
                 with open(self.args.generate_krb5_file, "w+") as host_file:
                     data = f"""
@@ -1286,9 +1288,12 @@ class smb(connection):
         return
 
     def users(self):
-        if len(self.args.users) > 0:
+        if self.args.users:
             self.logger.debug(f"Dumping users: {', '.join(self.args.users)}")
-        return UserSamrDump(self).dump(self.args.users)
+        return UserSamrDump(self).dump(requested_users=self.args.users, dump_path=self.args.users_export)
+
+    def users_export(self):
+        self.users()
 
     def computers(self):
         self.logger.fail("[REMOVED] Arg moved to the ldap protocol")
